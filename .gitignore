@@ -1,0 +1,4 @@
+build/
+package/
+*.zip
+.codegraph/daemon.pid

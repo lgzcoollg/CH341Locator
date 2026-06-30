@@ -1,0 +1,141 @@
+stages:
+  - build
+  - tag
+  - release
+
+# ============================================================
+# Linux（原生）
+# ============================================================
+build:linux:
+  stage: build
+  image: debian:bookworm-slim
+  before_script:
+    - echo "deb https://mirrors.aliyun.com/debian bookworm main" > /etc/apt/sources.list
+    - echo "deb https://mirrors.aliyun.com/debian bookworm-updates main" >> /etc/apt/sources.list
+    - echo "deb https://mirrors.aliyun.com/debian-security bookworm-security main" >> /etc/apt/sources.list
+    - apt-get update -qq || true
+    - apt-get install -y -qq cmake build-essential git
+  script:
+    - cmake -S . -B build
+    - cmake --build build
+    - cmake --build build --target CH341Locator_test
+    - cd build && ctest --verbose; cd $CI_PROJECT_DIR
+    - 'ver=$(grep ''#define CH341LOCATOR_VERSION'' include/CH341Locator.h | grep -o ''".*"'' | tr -d ''"'')'
+    - mkdir -p package/linux
+    - cp build/bin/libCH341Locator.so package/linux/
+    - cp build/bin/ch341locator_demo package/linux/
+    - cp include/CH341Locator.h package/linux/
+    - cp README.md package/linux/
+    - cd package && tar czf "../CH341Locator-v$ver-linux.tar.gz" linux/
+  artifacts:
+    paths:
+      - CH341Locator-*-linux.tar.gz
+
+# ============================================================
+# Windows（MinGW 交叉编译，Win32 + x64 矩阵）
+# ============================================================
+build:windows:
+  stage: build
+  parallel:
+    matrix:
+      - ARCH: x64
+        IMAGE: dockcross/windows-static-x64:latest
+        CMAKE: /usr/src/mxe/usr/bin/x86_64-w64-mingw32.static-cmake
+        PKG: mingw64
+      - ARCH: x86
+        IMAGE: dockcross/windows-static-x86:latest
+        CMAKE: /usr/src/mxe/usr/bin/i686-w64-mingw32.static-cmake
+        PKG: mingw32
+  image: $IMAGE
+  script:
+    - '$CMAKE -S . -B build-$ARCH'
+    - cmake --build build-$ARCH
+    - cmake --build build-$ARCH --target CH341Locator_test || true
+    - cd $CI_PROJECT_DIR
+    - 'ver=$(grep ''#define CH341LOCATOR_VERSION'' include/CH341Locator.h | grep -o ''".*"'' | tr -d ''"'')'
+    - mkdir -p package/$PKG
+    - cp build-$ARCH/bin/libCH341Locator.dll package/$PKG/
+    - cp build-$ARCH/bin/libCH341Locator.dll.a package/$PKG/ 2>/dev/null || true
+    - cp build-$ARCH/bin/ch341locator_demo.exe package/$PKG/
+    - cp include/CH341Locator.h package/$PKG/
+    - cp README.md package/$PKG/
+    - cd package && tar czf "../CH341Locator-v$ver-$PKG.tar.gz" $PKG/
+  artifacts:
+    paths:
+      - CH341Locator-*-mingw*.tar.gz
+
+# ============================================================
+# macOS
+# ============================================================
+build:macos:
+  stage: build
+  tags:
+    - macos
+  script:
+    - cmake -S . -B build
+    - cmake --build build
+    - cmake --build build --target CH341Locator_test
+    - cd build && ctest --verbose; cd $CI_PROJECT_DIR
+    - 'ver=$(grep ''#define CH341LOCATOR_VERSION'' include/CH341Locator.h | grep -o ''".*"'' | tr -d ''"'')'
+    - mkdir -p package/macos
+    - cp build/bin/libCH341Locator.dylib package/macos/
+    - cp build/bin/ch341locator_demo package/macos/
+    - cp include/CH341Locator.h package/macos/
+    - cp README.md package/macos/
+    - cd package && tar czf "../CH341Locator-v$ver-macos.tar.gz" macos/
+  artifacts:
+    paths:
+      - CH341Locator-*-macos.tar.gz
+
+# ============================================================
+# 自动 Release（main 分支构建通过后）
+# ============================================================
+auto-release:
+  stage: tag
+  image: debian:bookworm-slim
+  needs:
+    - job: build:linux
+      artifacts: true
+    - job: build:windows
+      artifacts: true
+    - job: build:macos
+      artifacts: true
+      optional: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+  before_script:
+    - echo "deb https://mirrors.aliyun.com/debian bookworm main" > /etc/apt/sources.list
+    - echo "deb https://mirrors.aliyun.com/debian bookworm-updates main" >> /etc/apt/sources.list
+    - echo "deb https://mirrors.aliyun.com/debian-security bookworm-security main" >> /etc/apt/sources.list
+    - apt-get update -qq || true
+    - apt-get install -y -qq git curl jq
+  script:
+    - 'ver=$(grep ''#define CH341LOCATOR_VERSION'' include/CH341Locator.h | grep -o ''".*"'' | tr -d ''"'')'
+    - tag="v$ver"
+    - 'echo "Version: $ver Tag: $tag"'
+    - 'echo "Creating tag: $tag"'
+    - 'git config user.email "gitlab-ci@openfile.com"; git config user.name "gitlab-ci"'
+    - 'git tag -d "$tag" 2>&1 || true; git tag "$tag" -m "CH341Locator v$ver"'
+    - 'git push -f "http://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}:${CI_SERVER_PORT}/${CI_PROJECT_PATH}.git" "$tag"'
+    - 'echo "Tag pushed: $tag"'
+    - 'echo "VER=$ver" >> variables.env'
+    - 'echo "TAG=$tag" >> variables.env'
+    - files=$(find . -name "CH341Locator-*.tar.gz" -maxdepth 1 | sed 's|^\./||' | tr '\n' ',' | sed 's/,$//')
+    - 'echo "Assets: $files"'
+  artifacts:
+    reports:
+      dotenv: variables.env
+    paths:
+      - CH341Locator-*.tar.gz
+
+create-release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: auto-release
+      artifacts: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+  script:
+    - 'release-cli create --name "CH341Locator v$VER" --tag-name "$TAG" --description "自动构建产物: CH341Locator-v$VER-mingw64.tar.gz, CH341Locator-v$VER-linux.tar.gz, CH341Locator-v$VER-mingw32.tar.gz"'
+
