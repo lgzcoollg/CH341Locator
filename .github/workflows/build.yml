@@ -1,0 +1,145 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ============================================================
+  # 构建 + 测试矩阵
+  # ============================================================
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: win32
+            cmake-args: -A Win32
+            dll: CH341Locator.dll
+            lib: CH341Locator.lib
+            demo: ch341locator_demo.exe
+            pkg-suffix: win32
+          - os: windows-latest
+            name: x64
+            cmake-args: -A x64
+            dll: CH341Locator.dll
+            lib: CH341Locator.lib
+            demo: ch341locator_demo.exe
+            pkg-suffix: x64
+          - os: ubuntu-latest
+            name: linux
+            cmake-args: ""
+            dll: libCH341Locator.so
+            lib: ""
+            demo: ch341locator_demo
+            pkg-suffix: linux
+          - os: macos-latest
+            name: macos
+            cmake-args: ""
+            dll: libCH341Locator.dylib
+            lib: ""
+            demo: ch341locator_demo
+            pkg-suffix: macos
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Configure
+        run: cmake -S . -B build ${{ matrix.cmake-args }}
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Build test
+        run: cmake --build build --config Release --target CH341Locator_test
+
+      - name: Test
+        run: ctest --verbose -C Release
+        working-directory: build
+
+      - name: Package
+        shell: bash
+        run: |
+          ver=$(grep '#define CH341LOCATOR_VERSION' include/CH341Locator.h | sed 's/.*"\(.*\)".*/\1/')
+          pkgdir="package/${{ matrix.pkg-suffix }}"
+          mkdir -p "$pkgdir"
+          cp "build/bin/Release/${{ matrix.dll }}" "$pkgdir/" 2>/dev/null || cp "build/bin/${{ matrix.dll }}" "$pkgdir/" 2>/dev/null || true
+          if [ -n "${{ matrix.lib }}" ]; then
+            cp "build/lib/Release/${{ matrix.lib }}" "$pkgdir/" 2>/dev/null || true
+          fi
+          cp "build/bin/Release/${{ matrix.demo }}" "$pkgdir/" 2>/dev/null || cp "build/bin/${{ matrix.demo }}" "$pkgdir/" 2>/dev/null || true
+          cp include/CH341Locator.h "$pkgdir/"
+          cp README.md "$pkgdir/"
+
+      - name: Archive
+        shell: bash
+        run: |
+          ver=$(grep '#define CH341LOCATOR_VERSION' include/CH341Locator.h | sed 's/.*"\(.*\)".*/\1/')
+          cd package && tar czf "../CH341Locator-v$ver-${{ matrix.pkg-suffix }}.tar.gz" "${{ matrix.pkg-suffix }}/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.pkg-suffix }}
+          path: CH341Locator-*.tar.gz
+
+  # ============================================================
+  # 自动打 tag + Release（仅 push 到 main，且构建通过后）
+  # ============================================================
+  auto-release:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Extract version
+        run: |
+          echo "VERSION=$(grep '#define CH341LOCATOR_VERSION' include/CH341Locator.h | sed 's/.*"\(.*\)".*/\1/')" >> $GITHUB_ENV
+          echo "TAG=v$(grep '#define CH341LOCATOR_VERSION' include/CH341Locator.h | sed 's/.*"\(.*\)".*/\1/')" >> $GITHUB_ENV
+
+      - name: Check tag exists
+        run: |
+          if git tag -l | grep -q "^$TAG$"; then
+            echo "TAG_EXISTS=true" >> $GITHUB_ENV
+          else
+            echo "TAG_EXISTS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Create tag
+        if: env.TAG_EXISTS == 'false'
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git tag -a "$TAG" -m "CH341Locator v$VERSION"
+          git push origin "$TAG"
+
+      - name: Download artifacts
+        if: env.TAG_EXISTS == 'false'
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Create Release
+        if: env.TAG_EXISTS == 'false'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.TAG }}
+          name: CH341Locator v${{ env.VERSION }}
+          files: artifacts/**/*.tar.gz
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
